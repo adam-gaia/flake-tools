@@ -1,11 +1,11 @@
 [package]
 name = "flake-tools"
-description = "Utility for working with nix flakes"
+description = "Utilities for working with nix flakes"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/adam-gaia/flake"
-repository = "https://github.com/adam-gaia/flake"
+homepage = "https://github.com/adam-gaia/flake-tools"
+repository = "https://github.com/adam-gaia/flake-tools"
 
 [[bin]]
 name = "flake"
