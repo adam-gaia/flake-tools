@@ -1,17 +1,22 @@
-use anyhow::bail;
-use anyhow::Result;
 use clap::Parser;
 use derivation::Derivation;
+use eyre::bail;
+use eyre::Result;
 use log::debug;
 use log::warn;
 use s_string::s;
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use tokio_stream::StreamExt;
+use xcommand::StdioType;
+use xcommand::XCommand;
+use xcommand::XStatus;
 mod cli;
 mod derivation;
 use cli::Cli;
+use serde_json::Value;
 
 fn back_search(dir: &Path, file: &str) -> Result<PathBuf> {
     let mut parent = Some(dir);
@@ -38,11 +43,55 @@ fn system() -> &'static str {
     }
 }
 
-fn nix(args: &[String]) -> Result<()> {
-    let nix = which::which("nix")?;
-    debug!("Running command {} {:?}", nix.display(), args);
-    Command::new(&nix).args(args).spawn()?;
-    Ok(())
+async fn nix(
+    args: &[String],
+    print_stdout: bool,
+    print_stderr: bool,
+) -> Result<(Vec<String>, Vec<String>, i32)> {
+    let bin = which::which("nix")?;
+
+    debug!("Running command {} {:?}", bin.display(), args);
+    let mut fixed_args = Vec::with_capacity(args.len());
+    for arg in args {
+        fixed_args.push(arg.as_str());
+    }
+    let Ok(mut child) = XCommand::builder(&bin)?
+        .args(&fixed_args)? // TODO: make xcommand args accept anything that derefs to a &str
+        .build()
+        .spawn()
+    else {
+        bail!("Unable to run {}", bin.display());
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let mut streamer = child.streamer();
+    let mut stream = streamer.stream();
+    while let Some(item) = stream.next().await {
+        let (message_type, message) = item?;
+        match message_type {
+            StdioType::Stdout => {
+                if print_stdout {
+                    println!("[stdout]{}", &message);
+                }
+                stdout.push(message);
+            }
+            StdioType::Stderr => {
+                if print_stderr {
+                    println!("[stderr]{}", &message);
+                }
+                stderr.push(message);
+            }
+        }
+    }
+
+    // Grab the exit code of the process
+    let Ok(XStatus::Exited(code)) = child.status().await else {
+        bail!("Child process was expected to have finished");
+    };
+
+    Ok((stdout, stderr, code))
 }
 
 #[derive(Debug)]
@@ -67,39 +116,99 @@ impl Flake {
         Ok(Self { root, system })
     }
 
-    pub fn check(&self, derivation: Option<Derivation>) -> Result<()> {
+    pub async fn check(&self, derivation: Option<Derivation>) -> Result<()> {
         let mut args = vec![s!("flake"), s!("check")];
         if let Some(derivation) = derivation {
             args.push(derivation.to_string("checks", &self.system));
         }
-        nix(&args)?;
+        nix(&args, true, true).await?;
         Ok(())
     }
 
-    pub fn build(&self, derivation: Option<Derivation>) -> Result<()> {
+    pub async fn build(&self, derivation: Option<Derivation>) -> Result<()> {
         let mut args = vec![s!("build")];
         if let Some(derivation) = derivation {
             args.push(derivation.to_string("packages", &self.system));
         }
-        nix(&args)
+        nix(&args, true, true).await?;
+        Ok(())
     }
 
-    pub fn run(&self, derivation: Option<Derivation>) -> Result<()> {
+    pub async fn run(&self, derivation: Option<Derivation>) -> Result<()> {
         let mut args = vec![s!("run")];
         if let Some(derivation) = derivation {
             args.push(derivation.to_string("packages", &self.system));
         }
-        nix(&args)
+        nix(&args, true, true).await?;
+        Ok(())
     }
 
-    pub fn show(&self) -> Result<()> {
+    pub async fn show(&self) -> Result<()> {
         // TODO: Take a filter and show all packages/devshells/etc and filter by system
-        let args = vec![s!("flake"), s!("show")];
-        nix(&args)
+        let args = vec![s!("flake"), s!("show"), s!("--json")];
+        let (stdout, _, _) = nix(&args, false, false).await?;
+
+        let foo: Value = serde_json::from_str(stdout.join("\n").trim())?;
+
+        let mut bar = HashMap::new();
+        match foo {
+            Value::Object(map) => {
+                for (ttype, v) in map {
+                    bar.insert(ttype.clone(), Vec::new());
+
+                    // TODO: add an option to filter types?
+                    match v {
+                        Value::Object(map) => {
+                            for (system, v) in map {
+                                if system == self.system {
+                                    match v {
+                                        Value::Object(map) => {
+                                            for (k, v) in map {
+                                                match v {
+                                                    Value::Object(map) => {
+                                                        let Some(name) = map.get("name") else {
+                                                            continue;
+                                                        };
+                                                        let name = name.as_str().unwrap();
+                                                        let entry = format!(
+                                                            "{}.{system}.{k}: {name}",
+                                                            ttype.clone()
+                                                        );
+
+                                                        let vec = bar.get_mut(&ttype).unwrap();
+                                                        vec.push(entry);
+                                                    }
+                                                    _ => continue,
+                                                }
+                                            }
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+            _ => {
+                bail!("Unexpected output from nix flake show")
+            }
+        }
+
+        for (k, v) in bar {
+            println!("> {}", k);
+            for entry in v {
+                println!("  - {}", entry);
+            }
+        }
+
+        Ok(())
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
 
@@ -107,16 +216,16 @@ fn main() -> Result<()> {
 
     match args.command() {
         cli::Command::Build { derivation } => {
-            flake.build(derivation)?;
+            flake.build(derivation).await?;
         }
         cli::Command::Check { derivation } => {
-            flake.check(derivation)?;
+            flake.check(derivation).await?;
         }
         cli::Command::Run { derivation } => {
-            flake.run(derivation)?;
+            flake.run(derivation).await?;
         }
         cli::Command::Show {} => {
-            flake.show()?;
+            flake.show().await?;
         }
     }
 
