@@ -257,7 +257,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "which 7.0.2",
- "winnow 0.7.1",
+ "winnow 0.7.14",
  "xcommand",
 ]
 
@@ -922,9 +922,9 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "0.7.1"
+version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e376c75f4f43f44db463cf729e0d3acbf954d13e22c51e26e4c264b4ab545f"
+checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
 dependencies = [
  "memchr",
 ]
